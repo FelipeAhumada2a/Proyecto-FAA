@@ -1,20 +1,24 @@
-"""HOME DUO · Fase 1 (MVP). App única en Streamlit + Supabase.
+"""HOME DUO · Fase 1 (MVP). App única en Streamlit + Supabase, sin cuentas de correo.
 
 ARCHIVOS DEL REPO: solo app.py y requirements.txt.
 
 PUESTA EN MARCHA
-1. Supabase: crea un proyecto. En SQL Editor pega el esquema (la app lo muestra
-   completo cuando falta configuración, o en Ajustes > Esquema SQL) y ejecútalo una vez.
-2. Supabase > Project Settings > API: copia Project URL y la clave "anon public".
-   No uses la clave service_role.
+1. Supabase: crea un proyecto. En SQL Editor pega el esquema (está en Ajustes >
+   Esquema SQL, o la app lo muestra si falta configuración) y ejecútalo una vez.
+2. Supabase > Project Settings > API: copia "Project URL" y la clave "service_role".
 3. Streamlit Cloud > tu app > Settings > Secrets:
        SUPABASE_URL = "https://xxxx.supabase.co"
-       SUPABASE_ANON_KEY = "eyJ..."
-4. Uno crea cuenta y hogar; en Ajustes está el código para que la pareja se una.
+       SUPABASE_KEY = "eyJ... (service_role)"
+       APP_PASSWORD = "una-clave-larga-que-solo-saben-ustedes"
+4. Cada uno entra con su nombre y la clave compartida.
 
-LIMITACIONES: sincronización manual (botón Actualizar), la sesión se pierde al
-recargar, sin fotos todavía. Fases 2 a 5 pendientes.
+SEGURIDAD: la clave service_role vive solo en los secrets del servidor de Streamlit,
+nunca llega al navegador. Las tablas tienen RLS activo y sin políticas, por lo que la
+clave pública (anon) no puede leer nada. El acceso lo controla APP_PASSWORD: usa una
+clave larga y no compartas el link con sesión iniciada (contiene un token de sesión).
 """
+import hashlib
+import hmac
 from datetime import date, datetime
 
 import streamlit as st
@@ -50,30 +54,24 @@ TEMPLATES = {
 KINDS = ["Obligatorio", "Preferencia"]
 
 SCHEMA_SQL = """
--- HOME DUO · Esquema Fase 1
--- Ejecutar completo en Supabase > SQL Editor (una sola vez).
+-- HOME DUO · Esquema Fase 1 (sin cuentas de correo)
+-- Ejecutar completo en Supabase > SQL Editor. Borra y recrea las tablas de HOME DUO.
+
+drop table if exists activity, comments, purchases, products, categories, household_members, households cascade;
+drop function if exists is_member(uuid);
+drop function if exists create_household(text, text);
+drop function if exists join_household(text, text);
 
 create extension if not exists pgcrypto;
 
--- ───────── Tablas ─────────
-create table if not exists households (
+create table households (
   id uuid primary key default gen_random_uuid(),
-  name text not null,
-  invite_code text not null unique,
+  name text not null default 'Nuestro departamento',
   total_budget numeric(14,0) not null default 0,
   created_at timestamptz not null default now()
 );
 
-create table if not exists household_members (
-  household_id uuid not null references households(id) on delete cascade,
-  user_id uuid not null references auth.users(id) on delete cascade,
-  display_name text not null,
-  joined_at timestamptz not null default now(),
-  primary key (household_id, user_id)
-);
-create index if not exists idx_members_user on household_members(user_id);
-
-create table if not exists categories (
+create table categories (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
   parent_id uuid references categories(id) on delete set null,
@@ -83,7 +81,7 @@ create table if not exists categories (
   unique (household_id, name)
 );
 
-create table if not exists products (
+create table products (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
   category_id uuid references categories(id) on delete set null,
@@ -101,19 +99,18 @@ create table if not exists products (
   priority text not null default 'Media' check (priority in ('Alta','Media','Baja')),
   notes text,
   reference_url text,
-  -- Requisitos y preferencias: [{"label": "...", "value": "...", "kind": "Obligatorio"|"Preferencia"}]
   requirements jsonb not null default '[]'::jsonb,
   status text not null default 'Pendiente de cotización' check (status in (
     'Pendiente de cotización','En cotización','En evaluación',
     'Pendiente de compra','Comprado','Descartado')),
-  created_by uuid not null default auth.uid() references auth.users(id),
-  updated_by uuid references auth.users(id),
+  created_by text not null,
+  updated_by text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-create index if not exists idx_products_hh on products(household_id, status);
+create index idx_products_hh on products(household_id, status);
 
-create table if not exists purchases (
+create table purchases (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
   product_id uuid not null references products(id) on delete cascade,
@@ -123,147 +120,45 @@ create table if not exists purchases (
   purchase_url text,
   order_number text,
   comments text,
-  registered_by uuid not null default auth.uid() references auth.users(id),
+  registered_by text not null,
   created_at timestamptz not null default now()
 );
-create index if not exists idx_purchases_hh on purchases(household_id);
+create index idx_purchases_hh on purchases(household_id);
 
-create table if not exists comments (
+create table comments (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
   product_id uuid not null references products(id) on delete cascade,
-  user_id uuid not null default auth.uid() references auth.users(id),
+  user_id text not null,
   body text not null check (length(body) between 1 and 2000),
   created_at timestamptz not null default now()
 );
-create index if not exists idx_comments_product on comments(product_id, created_at);
+create index idx_comments_product on comments(product_id, created_at);
 
-create table if not exists activity (
+create table activity (
   id uuid primary key default gen_random_uuid(),
   household_id uuid not null references households(id) on delete cascade,
-  user_id uuid not null default auth.uid() references auth.users(id),
+  user_id text not null,
   product_id uuid references products(id) on delete set null,
   action text not null,
   detail text,
   created_at timestamptz not null default now()
 );
-create index if not exists idx_activity_hh on activity(household_id, created_at desc);
+create index idx_activity_hh on activity(household_id, created_at desc);
 
--- ───────── Función de pertenencia ─────────
-create or replace function is_member(hid uuid)
-returns boolean
-language sql stable security definer
-set search_path = public
-as $$
-  select exists (
-    select 1 from household_members
-    where household_id = hid and user_id = auth.uid()
-  );
-$$;
-
--- ───────── Row Level Security ─────────
-alter table households        enable row level security;
-alter table household_members enable row level security;
-alter table categories        enable row level security;
-alter table products          enable row level security;
-alter table purchases         enable row level security;
-alter table comments          enable row level security;
-alter table activity          enable row level security;
-
--- households: solo lectura/edición para miembros. La creación va por RPC.
-create policy hh_select on households for select using (is_member(id));
-create policy hh_update on households for update using (is_member(id)) with check (is_member(id));
-
-create policy mem_select on household_members for select using (is_member(household_id));
-create policy mem_update_own on household_members for update
-  using (user_id = auth.uid()) with check (user_id = auth.uid());
-
-create policy cat_all on categories for all
-  using (is_member(household_id)) with check (is_member(household_id));
-create policy prod_all on products for all
-  using (is_member(household_id)) with check (is_member(household_id));
-create policy pur_all on purchases for all
-  using (is_member(household_id)) with check (is_member(household_id));
-
-create policy com_select on comments for select using (is_member(household_id));
-create policy com_insert on comments for insert
-  with check (is_member(household_id) and user_id = auth.uid());
-create policy com_delete on comments for delete using (user_id = auth.uid());
-
-create policy act_select on activity for select using (is_member(household_id));
-create policy act_insert on activity for insert
-  with check (is_member(household_id) and user_id = auth.uid());
-
--- ───────── RPC: crear hogar y unirse con código ─────────
-create or replace function create_household(p_name text, p_display text)
-returns uuid
-language plpgsql security definer
-set search_path = public
-as $$
-declare
-  hid uuid;
-  cat text;
-  i int := 0;
-begin
-  if auth.uid() is null then raise exception 'No autenticado'; end if;
-  if exists (select 1 from household_members where user_id = auth.uid()) then
-    raise exception 'Ya perteneces a un hogar';
-  end if;
-
-  insert into households (name, invite_code)
-  values (p_name, upper(substr(encode(gen_random_bytes(6), 'hex'), 1, 8)))
-  returning id into hid;
-
-  insert into household_members (household_id, user_id, display_name)
-  values (hid, auth.uid(), p_display);
-
-  foreach cat in array array[
-    'Living','Comedor','Cocina','Electrodomésticos','Dormitorio principal',
-    'Dormitorio secundario','Baño','Terraza','Decoración','Iluminación',
-    'Tecnología','Organización','Herramientas','Otros']
-  loop
-    insert into categories (household_id, name, sort) values (hid, cat, i);
-    i := i + 1;
-  end loop;
-
-  return hid;
-end;
-$$;
-
-create or replace function join_household(p_code text, p_display text)
-returns uuid
-language plpgsql security definer
-set search_path = public
-as $$
-declare
-  hid uuid;
-begin
-  if auth.uid() is null then raise exception 'No autenticado'; end if;
-  if exists (select 1 from household_members where user_id = auth.uid()) then
-    raise exception 'Ya perteneces a un hogar';
-  end if;
-
-  select id into hid from households where invite_code = upper(trim(p_code));
-  if hid is null then raise exception 'Código de invitación inválido'; end if;
-
-  if (select count(*) from household_members where household_id = hid) >= 2 then
-    raise exception 'Este hogar ya tiene dos integrantes';
-  end if;
-
-  insert into household_members (household_id, user_id, display_name)
-  values (hid, auth.uid(), p_display);
-  return hid;
-end;
-$$;
-
-revoke all on function create_household(text, text) from public, anon;
-revoke all on function join_household(text, text) from public, anon;
-grant execute on function create_household(text, text) to authenticated;
-grant execute on function join_household(text, text) to authenticated;
-
--- Sincronización en tiempo real (se usará en una fase posterior)
-alter publication supabase_realtime add table products, comments, activity;
+-- RLS activo y SIN políticas: la clave pública (anon) no puede leer ni escribir nada.
+-- La app accede con la clave service_role, guardada solo en los secrets del servidor.
+alter table households enable row level security;
+alter table categories enable row level security;
+alter table products   enable row level security;
+alter table purchases  enable row level security;
+alter table comments   enable row level security;
+alter table activity   enable row level security;
 """
+
+DEFAULT_CATEGORIES = ["Living", "Comedor", "Cocina", "Electrodomésticos", "Dormitorio principal",
+                      "Dormitorio secundario", "Baño", "Terraza", "Decoración", "Iluminación",
+                      "Tecnología", "Organización", "Herramientas", "Otros"]
 
 # ───────────────────────── Estilo ─────────────────────────
 CSS = """
@@ -318,22 +213,22 @@ def log(action: str, detail: str = "", product_id: str | None = None):
     try:
         db().table("activity").insert({
             "household_id": st.session_state["hid"], "action": action,
-            "detail": detail, "product_id": product_id}).execute()
+            "detail": detail, "product_id": product_id,
+            "user_id": st.session_state["uid"]}).execute()
     except Exception:
         pass  # el historial nunca debe bloquear la acción principal
 
 
 def load_household():
-    uid = st.session_state["uid"]
-    rows = db().table("household_members").select("*").eq("user_id", uid).execute().data
-    if not rows:
-        st.session_state["hid"] = None
-        return
-    st.session_state["hid"] = rows[0]["household_id"]
-    hid = st.session_state["hid"]
-    st.session_state["hh"] = db().table("households").select("*").eq("id", hid).single().execute().data
-    members = db().table("household_members").select("*").eq("household_id", hid).execute().data
-    st.session_state["members"] = {m["user_id"]: m["display_name"] for m in members}
+    rows = db().table("households").select("*").order("created_at").limit(1).execute().data
+    if rows:
+        hh = rows[0]
+    else:  # primera vez: crea el hogar y las categorías iniciales
+        hh = db().table("households").insert({"name": "Nuestro departamento"}).execute().data[0]
+        db().table("categories").insert(
+            [{"household_id": hh["id"], "name": n, "sort": i} for i, n in enumerate(DEFAULT_CATEGORIES)]).execute()
+    st.session_state["hid"] = hh["id"]
+    st.session_state["hh"] = hh
 
 
 def fetch(table: str, order: str = "created_at", desc: bool = True, limit: int | None = None):
@@ -344,72 +239,39 @@ def fetch(table: str, order: str = "created_at", desc: bool = True, limit: int |
 
 
 def who(uid: str) -> str:
-    return st.session_state["members"].get(uid, "Alguien")
+    return uid or "Alguien"
 
 
 # ───────────────────────── Autenticación ─────────────────────────
+def _sig(name: str) -> str:
+    key = str(st.secrets["APP_PASSWORD"]).encode()
+    return hmac.new(key, name.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def restore_session():
+    """Recupera la sesión desde el token firmado del link (sobrevive a recargar la página)."""
+    token = st.query_params.get("s", "")
+    if "." in token:
+        name, sig = token.rsplit(".", 1)
+        if name and hmac.compare_digest(sig, _sig(name)):
+            st.session_state["uid"] = name
+
+
 def auth_screen():
     st.markdown("## HOME DUO")
     st.caption("Equipar el departamento, de a dos.")
-    tab_in, tab_up = st.tabs(["Iniciar sesión", "Crear cuenta"])
-    with tab_in:
-        with st.form("login"):
-            email = st.text_input("Correo")
-            pw = st.text_input("Contraseña", type="password")
-            if st.form_submit_button("Entrar", type="primary", use_container_width=True):
-                try:
-                    res = st.session_state["client"].auth.sign_in_with_password({"email": email, "password": pw})
-                    st.session_state["uid"] = res.user.id
-                    st.rerun()
-                except Exception as e:
-                    show_error(e)
-    with tab_up:
-        with st.form("signup"):
-            email = st.text_input("Correo", key="su_mail")
-            pw = st.text_input("Contraseña (mínimo 8 caracteres)", type="password", key="su_pw")
-            if st.form_submit_button("Crear cuenta", type="primary", use_container_width=True):
-                try:
-                    res = st.session_state["client"].auth.sign_up({"email": email, "password": pw})
-                    if res.session:
-                        st.session_state["uid"] = res.user.id
-                        st.rerun()
-                    else:
-                        st.success("Cuenta creada. Confirma tu correo y luego inicia sesión.")
-                except Exception as e:
-                    show_error(e)
-
-
-def onboarding():
-    st.markdown("## Tu hogar compartido")
-    st.caption("Uno de los dos crea el hogar y comparte el código con el otro.")
-    t1, t2 = st.tabs(["Crear hogar", "Unirme con código"])
-    with t1:
-        with st.form("create_hh"):
-            name = st.text_input("Nombre del hogar", value="Nuestro departamento")
-            me = st.text_input("Tu nombre")
-            if st.form_submit_button("Crear hogar", type="primary", use_container_width=True):
-                if not name.strip() or not me.strip():
-                    st.warning("Completa ambos campos.")
-                else:
-                    try:
-                        db().rpc("create_household", {"p_name": name.strip(), "p_display": me.strip()}).execute()
-                        load_household()
-                        log("Hogar creado", name.strip())
-                        st.rerun()
-                    except Exception as e:
-                        show_error(e)
-    with t2:
-        with st.form("join_hh"):
-            code = st.text_input("Código de invitación")
-            me = st.text_input("Tu nombre", key="join_name")
-            if st.form_submit_button("Unirme", type="primary", use_container_width=True):
-                try:
-                    db().rpc("join_household", {"p_code": code, "p_display": me.strip()}).execute()
-                    load_household()
-                    log("Se unió al hogar", me.strip())
-                    st.rerun()
-                except Exception as e:
-                    show_error(e)
+    with st.form("login"):
+        name = st.text_input("Tu nombre")
+        pw = st.text_input("Clave de la casa", type="password")
+        if st.form_submit_button("Entrar", type="primary", use_container_width=True):
+            if not name.strip():
+                st.warning("Escribe tu nombre.")
+            elif not hmac.compare_digest(pw, str(st.secrets["APP_PASSWORD"])):
+                st.error("Clave incorrecta.")
+            else:
+                st.session_state["uid"] = name.strip()
+                st.query_params["s"] = f"{name.strip()}.{_sig(name.strip())}"
+                st.rerun()
 
 
 # ───────────────────────── Productos ─────────────────────────
@@ -497,6 +359,7 @@ def product_dialog(p: dict | None = None):
                 log("Producto editado", name.strip(), p["id"])
             else:
                 data["household_id"] = st.session_state["hid"]
+                data["created_by"] = st.session_state["uid"]
                 res = db().table("products").insert(data).execute()
                 log("Producto agregado", name.strip(), res.data[0]["id"])
             st.rerun()
@@ -525,7 +388,8 @@ def purchase_dialog(p: dict):
             db().table("purchases").insert({
                 "household_id": st.session_state["hid"], "product_id": p["id"], "store": store.strip(),
                 "final_price": int(price), "purchase_date": d.isoformat(), "purchase_url": url.strip() or None,
-                "order_number": order.strip() or None, "comments": comm.strip() or None}).execute()
+                "order_number": order.strip() or None, "comments": comm.strip() or None,
+                "registered_by": st.session_state["uid"]}).execute()
             db().table("products").update({"status": "Comprado", "updated_by": st.session_state["uid"],
                                            "updated_at": datetime.utcnow().isoformat() + "Z"}).eq("id", p["id"]).execute()
             log("Producto comprado", f"{p['name']} · {store.strip()} · {clp(price)}", p["id"])
@@ -548,7 +412,7 @@ def comments_block(p: dict):
         if st.form_submit_button("Comentar") and body.strip():
             try:
                 db().table("comments").insert({"household_id": st.session_state["hid"], "product_id": p["id"],
-                                               "body": body.strip()}).execute()
+                                               "body": body.strip(), "user_id": st.session_state["uid"]}).execute()
                 log("Comentario agregado", f"{p['name']}: {body.strip()[:80]}", p["id"])
                 st.rerun()
             except Exception as e:
@@ -755,45 +619,46 @@ def page_settings():
                 st.rerun()
             except Exception as e:
                 show_error(e)
-    st.markdown("### Integrantes")
-    for uid, nm in st.session_state["members"].items():
-        st.write(f"• {nm}" + (" (tú)" if uid == st.session_state["uid"] else ""))
-    if len(st.session_state["members"]) < 2:
-        st.markdown("Comparte este código con tu pareja para que se una:")
-        st.code(hh["invite_code"])
-    else:
-        st.caption("El hogar ya tiene sus dos integrantes; el código de invitación quedó inactivo.")
+    st.markdown("### Sesión")
+    st.write(f"Entraste como **{st.session_state['uid']}**.")
     with st.expander("Esquema SQL (referencia)"):
         st.code(SCHEMA_SQL, language="sql")
-    st.markdown("### Sesión")
     if st.button("Cerrar sesión", use_container_width=True):
-        try:
-            db().auth.sign_out()
-        except Exception:
-            pass
         st.session_state.clear()
+        st.query_params.clear()
         st.rerun()
 
 
 def setup_guide(reason: str):
     st.markdown("## Falta configurar Supabase")
     st.warning(reason)
+    if "Name or service not known" in reason or "getaddrinfo" in reason:
+        st.error("La SUPABASE_URL no existe o está mal escrita. Debe verse así: https://abcdxyz.supabase.co "
+                 "(sin /rest/v1, sin barra final y sin espacios).")
     st.markdown("1. En Supabase abre **SQL Editor**, pega este esquema y ejecútalo una vez.")
     st.code(SCHEMA_SQL, language="sql")
     st.markdown("2. En Streamlit Cloud abre **Settings > Secrets** y agrega:")
-    st.code('SUPABASE_URL = "https://xxxx.supabase.co"\nSUPABASE_ANON_KEY = "eyJ..."', language="toml")
-    st.caption("Luego recarga esta página.")
+    st.code('SUPABASE_URL = "https://xxxx.supabase.co"\nSUPABASE_KEY = "eyJ... (service_role)"\n'
+            'APP_PASSWORD = "una-clave-larga"', language="toml")
+    st.caption("Guarda, reinicia la app (Manage app > Reboot) y recarga esta página.")
 
 
 # ───────────────────────── Arranque ─────────────────────────
 def main():
+    missing = [k for k in ("SUPABASE_URL", "SUPABASE_KEY", "APP_PASSWORD") if not st.secrets.get(k)]
+    if missing:
+        setup_guide("Faltan estos secrets: " + ", ".join(missing))
+        st.stop()
     if "client" not in st.session_state:
         try:
-            st.session_state["client"] = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"])
-        except Exception:
-            setup_guide("Faltan SUPABASE_URL y SUPABASE_ANON_KEY en los secrets de la app.")
+            st.session_state["client"] = create_client(str(st.secrets["SUPABASE_URL"]).strip(),
+                                                       str(st.secrets["SUPABASE_KEY"]).strip())
+        except Exception as e:
+            setup_guide(f"No se pudo crear la conexión con Supabase. Detalle: {e}")
             st.stop()
 
+    if "uid" not in st.session_state:
+        restore_session()
     if "uid" not in st.session_state:
         auth_screen()
         return
@@ -802,11 +667,8 @@ def main():
         try:
             load_household()
         except Exception as e:
-            setup_guide(f"No se pudo leer la base de datos (¿ya ejecutaste el esquema?). Detalle: {e}")
+            setup_guide(f"No se pudo leer la base de datos. Detalle: {e}")
             st.stop()
-    if not st.session_state.get("hid"):
-        onboarding()
-        return
 
     pages = {"Inicio": page_home, "Productos": page_products, "Comprados": page_bought,
              "Categorías": page_categories, "Ajustes": page_settings}
@@ -822,3 +684,4 @@ def main():
 
 
 main()
+
