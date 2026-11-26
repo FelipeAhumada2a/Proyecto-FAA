@@ -1,9 +1,19 @@
 """HOME DUO · Fase 1 (MVP). App única en Streamlit + Supabase.
 
-Secrets requeridos (.streamlit/secrets.toml o Streamlit Cloud):
-    SUPABASE_URL = "https://xxxx.supabase.co"
-    SUPABASE_ANON_KEY = "eyJ..."
-Solo se usa la clave anon: la seguridad la imponen las políticas RLS de schema.sql.
+ARCHIVOS DEL REPO: solo app.py y requirements.txt.
+
+PUESTA EN MARCHA
+1. Supabase: crea un proyecto. En SQL Editor pega el esquema (la app lo muestra
+   completo cuando falta configuración, o en Ajustes > Esquema SQL) y ejecútalo una vez.
+2. Supabase > Project Settings > API: copia Project URL y la clave "anon public".
+   No uses la clave service_role.
+3. Streamlit Cloud > tu app > Settings > Secrets:
+       SUPABASE_URL = "https://xxxx.supabase.co"
+       SUPABASE_ANON_KEY = "eyJ..."
+4. Uno crea cuenta y hogar; en Ajustes está el código para que la pareja se una.
+
+LIMITACIONES: sincronización manual (botón Actualizar), la sesión se pierde al
+recargar, sin fotos todavía. Fases 2 a 5 pendientes.
 """
 from datetime import date, datetime
 
@@ -38,6 +48,222 @@ TEMPLATES = {
     "Cama": ["Tamaño", "Tipo", "Largo (cm)", "Ancho (cm)"],
 }
 KINDS = ["Obligatorio", "Preferencia"]
+
+SCHEMA_SQL = """
+-- HOME DUO · Esquema Fase 1
+-- Ejecutar completo en Supabase > SQL Editor (una sola vez).
+
+create extension if not exists pgcrypto;
+
+-- ───────── Tablas ─────────
+create table if not exists households (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  invite_code text not null unique,
+  total_budget numeric(14,0) not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists household_members (
+  household_id uuid not null references households(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  display_name text not null,
+  joined_at timestamptz not null default now(),
+  primary key (household_id, user_id)
+);
+create index if not exists idx_members_user on household_members(user_id);
+
+create table if not exists categories (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  parent_id uuid references categories(id) on delete set null,
+  name text not null,
+  sort int not null default 0,
+  created_at timestamptz not null default now(),
+  unique (household_id, name)
+);
+
+create table if not exists products (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  category_id uuid references categories(id) on delete set null,
+  name text not null,
+  space text,
+  brand text,
+  model text,
+  budget_min numeric(14,0),
+  budget_max numeric(14,0),
+  dimensions text,
+  color text,
+  material text,
+  features text,
+  quantity int not null default 1 check (quantity > 0),
+  priority text not null default 'Media' check (priority in ('Alta','Media','Baja')),
+  notes text,
+  reference_url text,
+  -- Requisitos y preferencias: [{"label": "...", "value": "...", "kind": "Obligatorio"|"Preferencia"}]
+  requirements jsonb not null default '[]'::jsonb,
+  status text not null default 'Pendiente de cotización' check (status in (
+    'Pendiente de cotización','En cotización','En evaluación',
+    'Pendiente de compra','Comprado','Descartado')),
+  created_by uuid not null default auth.uid() references auth.users(id),
+  updated_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_products_hh on products(household_id, status);
+
+create table if not exists purchases (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  product_id uuid not null references products(id) on delete cascade,
+  store text not null,
+  final_price numeric(14,0) not null check (final_price >= 0),
+  purchase_date date not null default current_date,
+  purchase_url text,
+  order_number text,
+  comments text,
+  registered_by uuid not null default auth.uid() references auth.users(id),
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_purchases_hh on purchases(household_id);
+
+create table if not exists comments (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  product_id uuid not null references products(id) on delete cascade,
+  user_id uuid not null default auth.uid() references auth.users(id),
+  body text not null check (length(body) between 1 and 2000),
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_comments_product on comments(product_id, created_at);
+
+create table if not exists activity (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  user_id uuid not null default auth.uid() references auth.users(id),
+  product_id uuid references products(id) on delete set null,
+  action text not null,
+  detail text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_activity_hh on activity(household_id, created_at desc);
+
+-- ───────── Función de pertenencia ─────────
+create or replace function is_member(hid uuid)
+returns boolean
+language sql stable security definer
+set search_path = public
+as $$
+  select exists (
+    select 1 from household_members
+    where household_id = hid and user_id = auth.uid()
+  );
+$$;
+
+-- ───────── Row Level Security ─────────
+alter table households        enable row level security;
+alter table household_members enable row level security;
+alter table categories        enable row level security;
+alter table products          enable row level security;
+alter table purchases         enable row level security;
+alter table comments          enable row level security;
+alter table activity          enable row level security;
+
+-- households: solo lectura/edición para miembros. La creación va por RPC.
+create policy hh_select on households for select using (is_member(id));
+create policy hh_update on households for update using (is_member(id)) with check (is_member(id));
+
+create policy mem_select on household_members for select using (is_member(household_id));
+create policy mem_update_own on household_members for update
+  using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+create policy cat_all on categories for all
+  using (is_member(household_id)) with check (is_member(household_id));
+create policy prod_all on products for all
+  using (is_member(household_id)) with check (is_member(household_id));
+create policy pur_all on purchases for all
+  using (is_member(household_id)) with check (is_member(household_id));
+
+create policy com_select on comments for select using (is_member(household_id));
+create policy com_insert on comments for insert
+  with check (is_member(household_id) and user_id = auth.uid());
+create policy com_delete on comments for delete using (user_id = auth.uid());
+
+create policy act_select on activity for select using (is_member(household_id));
+create policy act_insert on activity for insert
+  with check (is_member(household_id) and user_id = auth.uid());
+
+-- ───────── RPC: crear hogar y unirse con código ─────────
+create or replace function create_household(p_name text, p_display text)
+returns uuid
+language plpgsql security definer
+set search_path = public
+as $$
+declare
+  hid uuid;
+  cat text;
+  i int := 0;
+begin
+  if auth.uid() is null then raise exception 'No autenticado'; end if;
+  if exists (select 1 from household_members where user_id = auth.uid()) then
+    raise exception 'Ya perteneces a un hogar';
+  end if;
+
+  insert into households (name, invite_code)
+  values (p_name, upper(substr(encode(gen_random_bytes(6), 'hex'), 1, 8)))
+  returning id into hid;
+
+  insert into household_members (household_id, user_id, display_name)
+  values (hid, auth.uid(), p_display);
+
+  foreach cat in array array[
+    'Living','Comedor','Cocina','Electrodomésticos','Dormitorio principal',
+    'Dormitorio secundario','Baño','Terraza','Decoración','Iluminación',
+    'Tecnología','Organización','Herramientas','Otros']
+  loop
+    insert into categories (household_id, name, sort) values (hid, cat, i);
+    i := i + 1;
+  end loop;
+
+  return hid;
+end;
+$$;
+
+create or replace function join_household(p_code text, p_display text)
+returns uuid
+language plpgsql security definer
+set search_path = public
+as $$
+declare
+  hid uuid;
+begin
+  if auth.uid() is null then raise exception 'No autenticado'; end if;
+  if exists (select 1 from household_members where user_id = auth.uid()) then
+    raise exception 'Ya perteneces a un hogar';
+  end if;
+
+  select id into hid from households where invite_code = upper(trim(p_code));
+  if hid is null then raise exception 'Código de invitación inválido'; end if;
+
+  if (select count(*) from household_members where household_id = hid) >= 2 then
+    raise exception 'Este hogar ya tiene dos integrantes';
+  end if;
+
+  insert into household_members (household_id, user_id, display_name)
+  values (hid, auth.uid(), p_display);
+  return hid;
+end;
+$$;
+
+revoke all on function create_household(text, text) from public, anon;
+revoke all on function join_household(text, text) from public, anon;
+grant execute on function create_household(text, text) to authenticated;
+grant execute on function join_household(text, text) to authenticated;
+
+-- Sincronización en tiempo real (se usará en una fase posterior)
+alter publication supabase_realtime add table products, comments, activity;
+"""
 
 # ───────────────────────── Estilo ─────────────────────────
 CSS = """
@@ -537,6 +763,8 @@ def page_settings():
         st.code(hh["invite_code"])
     else:
         st.caption("El hogar ya tiene sus dos integrantes; el código de invitación quedó inactivo.")
+    with st.expander("Esquema SQL (referencia)"):
+        st.code(SCHEMA_SQL, language="sql")
     st.markdown("### Sesión")
     if st.button("Cerrar sesión", use_container_width=True):
         try:
@@ -547,13 +775,23 @@ def page_settings():
         st.rerun()
 
 
+def setup_guide(reason: str):
+    st.markdown("## Falta configurar Supabase")
+    st.warning(reason)
+    st.markdown("1. En Supabase abre **SQL Editor**, pega este esquema y ejecútalo una vez.")
+    st.code(SCHEMA_SQL, language="sql")
+    st.markdown("2. En Streamlit Cloud abre **Settings > Secrets** y agrega:")
+    st.code('SUPABASE_URL = "https://xxxx.supabase.co"\nSUPABASE_ANON_KEY = "eyJ..."', language="toml")
+    st.caption("Luego recarga esta página.")
+
+
 # ───────────────────────── Arranque ─────────────────────────
 def main():
     if "client" not in st.session_state:
         try:
             st.session_state["client"] = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"])
         except Exception:
-            st.error("Faltan SUPABASE_URL y SUPABASE_ANON_KEY en los secrets de la app. Revisa el README.")
+            setup_guide("Faltan SUPABASE_URL y SUPABASE_ANON_KEY en los secrets de la app.")
             st.stop()
 
     if "uid" not in st.session_state:
@@ -564,7 +802,7 @@ def main():
         try:
             load_household()
         except Exception as e:
-            show_error(e)
+            setup_guide(f"No se pudo leer la base de datos (¿ya ejecutaste el esquema?). Detalle: {e}")
             st.stop()
     if not st.session_state.get("hid"):
         onboarding()
