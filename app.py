@@ -154,6 +154,11 @@ alter table products   enable row level security;
 alter table purchases  enable row level security;
 alter table comments   enable row level security;
 alter table activity   enable row level security;
+
+-- Permisos para la clave service_role (algunos proyectos nuevos no los dan por defecto).
+grant usage on schema public to service_role;
+grant all on all tables in schema public to service_role;
+grant all on all sequences in schema public to service_role;
 """
 
 DEFAULT_CATEGORIES = ["Living", "Comedor", "Cocina", "Electrodomésticos", "Dormitorio principal",
@@ -168,7 +173,8 @@ CSS = """
 html, body, [class*="css"], .stApp { font-family:'Figtree', sans-serif; color:var(--ink); }
 .stApp { background: var(--bone); }
 h1, h2, h3 { font-family:'Bricolage Grotesque', sans-serif !important; letter-spacing:-0.02em; }
-.block-container { padding-top:1.6rem; padding-bottom:5rem; max-width:760px; }
+header[data-testid="stHeader"] { background: var(--bone); }
+.block-container { padding-top:4.5rem; padding-bottom:5rem; max-width:760px; }
 div[data-testid="stVerticalBlockBorderWrapper"] { border-radius:16px; border-color:#E3DBCB; background:#fff; }
 .stButton > button, .stFormSubmitButton > button { border-radius:12px; border:1px solid #D9D0BD; min-height:2.6rem; }
 .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] { background:var(--moss); border-color:var(--moss); color:#fff; }
@@ -684,4 +690,3 @@ def main():
 
 
 main()
-
