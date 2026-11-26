@@ -148,6 +148,18 @@ def page_inicio():
                  f"<small>{a['created_at'][:16].replace('T', ' ')}</small>",
                  unsafe_allow_html=True)
 
+# ───────────────────────── Productos ─────────────────────────
+def page_productos():
+    st.title("🛋️ Productos")
+    cats = sb().table("categories").select("id,name").eq("household_id", hid()).order("sort_order").execute().data
+    cat_name = {c["id"]: c["name"] for c in cats}
+    who = names()
+
+    with st.expander("➕ Agregar producto", expanded=False):
+        with st.form("nuevo", clear_on_submit=True):
+            name = st.text_input("Nombre del producto *")
+            cat = st.selectbox("Categoría", [c["id"] for c in cats], format_func=cat_name.get)
+            c1, c2 = st.columns(2)    
             brand = c1.text_input("Marca preferida")
             color = c2.text_input("Color")
             b_min = c1.number_input("Presupuesto mínimo (CLP)", min_value=0, step=10000)
