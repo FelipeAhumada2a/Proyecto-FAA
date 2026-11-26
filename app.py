@@ -1,3 +1,6 @@
+
+
+
 """HOME DUO — app completa en un solo archivo (Streamlit + Supabase)."""
 import streamlit as st
 from supabase import create_client
@@ -88,6 +91,7 @@ def household_setup_view():
                     st.rerun()
                 except Exception as e:
                     st.error(e)
+
 
 # ───────────────────────── Inicio ─────────────────────────
 def page_inicio():
@@ -229,7 +233,6 @@ def page_inicio():
                             st.rerun()
 
 
-
 # ───────────────────────── Comprados ─────────────────────────
 def page_comprados():
     st.title("✅ Comprados")
@@ -301,9 +304,6 @@ PAGES = {"🏠 Inicio": page_inicio, "🛋️ Productos": page_productos,
          "✅ Comprados": page_comprados, "⚙️ Config": page_config}
 choice = st.radio("Menú", list(PAGES), horizontal=True, label_visibility="collapsed")
 PAGES[choice]()
-
-
-
 
 
 
