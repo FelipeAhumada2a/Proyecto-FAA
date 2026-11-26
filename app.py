@@ -1,6 +1,4 @@
 
-
-
 """HOME DUO — app completa en un solo archivo (Streamlit + Supabase)."""
 import streamlit as st
 from supabase import create_client
@@ -28,7 +26,8 @@ def sb():
 
 
 def hid() -> str:
-    return st.session_state.hid
+    # ID fijo del hogar compartido, configurado en secrets.toml
+    return st.secrets["HOUSEHOLD_ID"]
 
 
 def clp(n) -> str:
@@ -47,50 +46,7 @@ def log(entity, entity_id, action, detail=None):
         "action": action, "detail": detail or {}}).execute()
 
 
-def names() -> dict:
-    rows = sb().table("profiles").select("id,display_name").execute().data
-    return {r["id"]: r["display_name"] for r in rows}
-
-
-# ───────────────────────── Acceso ─────────────────────────
-def login_view():
-    st.title("🏠 HOME DUO")
-    st.caption("Equipen su departamento juntos.")
-    with st.form("login"):
-        email = st.text_input("Correo")
-        pw = st.text_input("Contraseña", type="password")
-        if st.form_submit_button("Ingresar", use_container_width=True):
-            try:
-                r = sb().auth.sign_in_with_password({"email": email, "password": pw})
-                st.session_state.user = r.user
-                st.rerun()
-            except Exception as e:
-                st.error(f"No se pudo ingresar: {e}")
-
-
-def household_setup_view():
-    st.title("Tu hogar compartido")
-    c1, c2 = st.columns(2)
-    with c1:
-        with st.form("crear"):
-            st.subheader("Crear hogar")
-            name = st.text_input("Nombre", value="Nuestro departamento")
-            if st.form_submit_button("Crear", use_container_width=True):
-                try:
-                    sb().rpc("create_household", {"hname": name}).execute()
-                    st.rerun()
-                except Exception as e:
-                    st.error(e)
-    with c2:
-        with st.form("unirse"):
-            st.subheader("Tengo una invitación")
-            code = st.text_input("Código")
-            if st.form_submit_button("Unirme", use_container_width=True):
-                try:
-                    sb().rpc("accept_invite", {"invite_code": code.strip()}).execute()
-                    st.rerun()
-                except Exception as e:
-                    st.error(e)
+# Sin cuentas ni perfiles: la app se usa directamente y las acciones son anónimas.
 
 
 # ───────────────────────── Inicio ─────────────────────────
@@ -137,29 +93,27 @@ def page_inicio():
         st.caption("Define el presupuesto total en Configuración.")
 
     st.subheader("Actividad reciente")
-    who = names()
     acts = (sb().table("activity_log").select("*").eq("household_id", hid())
             .order("created_at", desc=True).limit(8).execute().data)
     if not acts:
         st.caption("Aún no hay actividad.")
     for a in acts:
-        st.write(f"**{who.get(a['user_id'], 'Alguien')}** · {a['action']} · "
+        st.write(f"**Actividad** · {a['action']} · "
                  f"{(a.get('detail') or {}).get('nombre', '')}  \n"
                  f"<small>{a['created_at'][:16].replace('T', ' ')}</small>",
                  unsafe_allow_html=True)
+
 
 # ───────────────────────── Productos ─────────────────────────
 def page_productos():
     st.title("🛋️ Productos")
     cats = sb().table("categories").select("id,name").eq("household_id", hid()).order("sort_order").execute().data
     cat_name = {c["id"]: c["name"] for c in cats}
-    who = names()
-
     with st.expander("➕ Agregar producto", expanded=False):
         with st.form("nuevo", clear_on_submit=True):
             name = st.text_input("Nombre del producto *")
             cat = st.selectbox("Categoría", [c["id"] for c in cats], format_func=cat_name.get)
-            c1, c2 = st.columns(2)    
+            c1, c2 = st.columns(2)
             brand = c1.text_input("Marca preferida")
             color = c2.text_input("Color")
             b_min = c1.number_input("Presupuesto mínimo (CLP)", min_value=0, step=10000)
@@ -210,7 +164,7 @@ def page_productos():
             st.markdown(f"**{p['name']}** &nbsp; {badge(p['status'])}", unsafe_allow_html=True)
             budget = f"hasta {clp(p['budget_max'])}" if p["budget_max"] else "sin presupuesto"
             st.caption(f"{cat_name.get(p['category_id'], '—')} · {budget} · x{p['quantity']} · "
-                       f"prioridad {p['priority']} · agregó {who.get(p['created_by'], '—')}")
+                       f"prioridad {p['priority']}")
             if p["requirements"]:
                 st.caption("Obligatorio: " + ", ".join(
                     f"{r['key']} {r['op']} {r['value']:g} {r['unit']}" for r in p["requirements"]))
@@ -248,7 +202,6 @@ def page_productos():
 # ───────────────────────── Comprados ─────────────────────────
 def page_comprados():
     st.title("✅ Comprados")
-    who = names()
     rows = (sb().table("purchases").select("*, products(name)").eq("household_id", hid())
             .order("purchased_at", desc=True).execute().data)
     if not rows:
@@ -279,72 +232,16 @@ def page_config():
             sb().table("households").update({"total_budget": val}).eq("id", hid()).execute()
             st.success("Guardado.")
 
-    st.subheader("Miembros")
-    members = sb().table("household_members").select("user_id").eq("household_id", hid()).execute().data
-    who = names()
-    for m in members:
-        st.write("• " + who.get(m["user_id"], "Miembro"))
-
-    if len(members) < 2:
-        st.subheader("Invitar a tu pareja")
-        if st.button("Generar código de invitación"):
-            inv = sb().table("invites").insert(
-                {"household_id": hid(), "created_by": st.session_state.user.id}).execute().data[0]
-            st.code(inv["code"])
-            st.caption("Compártelo con tu pareja: lo ingresa en 'Tengo una invitación'. Vence en 7 días.")
-
-    st.divider()
-    if st.button("Cerrar sesión"):
-        sb().auth.sign_out()
-        st.session_state.clear()
-        st.rerun()
+    st.caption("Esta aplicación es de acceso libre, sin registro ni inicio de sesión.")
 
 
 # ───────────────────────── Arranque ─────────────────────────
-if "user" not in st.session_state:
-    login_view()
-    st.stop()
-
-if "hid" not in st.session_state:
-    m = sb().table("household_members").select("household_id").limit(1).execute().data
-    if not m:
-        household_setup_view()
-        st.stop()
-    st.session_state.hid = m[0]["household_id"]
+# No se requiere autenticación. HOUSEHOLD_ID identifica el hogar compartido.
 
 PAGES = {"🏠 Inicio": page_inicio, "🛋️ Productos": page_productos,
          "✅ Comprados": page_comprados, "⚙️ Config": page_config}
 choice = st.radio("Menú", list(PAGES), horizontal=True, label_visibility="collapsed")
 PAGES[choice]()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
