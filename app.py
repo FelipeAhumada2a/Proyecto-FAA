@@ -18,6 +18,7 @@ PUESTA EN MARCHA
 import hashlib
 import hmac
 import re
+import unicodedata
 from datetime import date, datetime
 from urllib.parse import urlparse
 
@@ -50,7 +51,7 @@ TEMPLATES = {
     "Sofá": ["Largo máximo (cm)", "Profundidad máxima (cm)", "Número de cuerpos",
              "Tipo de sofá"],
     "Televisor": ["Tamaño (pulgadas)", "Resolución", "Tecnología"],
-    "Cama": ["Tamaño", "Tipo", "Largo (cm)", "Ancho (cm)"],
+    "Cama": ["Tamaño", "Tipo de base", "Material", "Largo (cm)", "Ancho (cm)"],
 }
 KINDS = ["Obligatorio", "Preferencia"]
 
@@ -367,7 +368,7 @@ def product_dialog(p: dict | None = None):
     dims = st.text_input("Dimensiones", value=p.get("dimensions") or "", placeholder="Ej: máx. 60 × 180 × 65 cm")
 
     st.markdown("**Requisitos y preferencias**")
-    st.caption("Obligatorio = el producto debe cumplirlo. Preferencia = deseable, puede ser flexible.")
+    st.caption("Obligatorio = el producto debe cumplirlo. Preferencia = deseable, puede ser flexible. Las filas Obligatorio guían la búsqueda automática y se comparan con cada resultado.")
     rows = p.get("requirements") or [{"label": l, "value": "", "kind": "Obligatorio"} for l in TEMPLATES.get(tpl, [])]
     edited = st.data_editor(
         rows if rows else [{"label": "", "value": "", "kind": "Preferencia"}],
@@ -379,7 +380,8 @@ def product_dialog(p: dict | None = None):
         })
     features = st.text_area("Características deseadas (texto libre)", value=p.get("features") or "")
     url = st.text_input("Link de referencia", value=p.get("reference_url") or "")
-    notes = st.text_area("Observaciones", value=p.get("notes") or "")
+    notes = st.text_area("Observaciones", value=p.get("notes") or "",
+                         help="Texto libre. No filtra los resultados: las condiciones importantes van en la tabla de Requisitos.")
 
     if editing:
         status = st.selectbox("Estado", [s for s in STATUSES if s != "Comprado" or p.get("status") == "Comprado"],
@@ -693,6 +695,8 @@ def page_settings():
 
 # ───────────────────────── Fase 2 · Cotizaciones ─────────────────────────
 HEADERS = {"User-Agent": "HOME-DUO/1.0 (herramienta personal de cotización)", "Accept-Language": "es-CL,es;q=0.9"}
+# Tiendas que nunca deben aparecer en las cotizaciones (patrón en minúsculas; se busca en tienda y link).
+EXCLUDED_PATTERN = r"mercado\s?libre|mercadolibre|mercadolivre|ebay"
 STORE_LIST = ["Falabella", "Paris", "Ripley", "Sodimac", "Easy", "Lider", "Hites", "ABC", "La Polar"]
 
 
@@ -744,6 +748,10 @@ def _int(x):
         return None
 
 
+def is_excluded(store: str, link: str = "") -> bool:
+    return bool(re.search(EXCLUDED_PATTERN, f"{store} {link}", re.I))
+
+
 def search_ready() -> bool:
     return bool(st.secrets.get("SERPER_API_KEY"))
 
@@ -753,23 +761,68 @@ def _price_clp(txt):
     return _int(re.sub(r"\D", "", m.group(0))) if m else None
 
 
-def build_queries(p: dict) -> list:
-    """Consulta 1: producto exacto (nombre + marca + modelo). Consulta 2: equivalentes de cualquier
-    marca con las características textuales obligatorias (las medidas numéricas no se pueden buscar)."""
-    base = p["name"].strip()
-    brand, model = (p.get("brand") or "").strip(), (p.get("model") or "").strip()
-    q1 = " ".join(x for x in [base, brand if brand.lower() not in base.lower() else "", model] if x)
-    extra = []
+def _hard_terms(p: dict) -> list:
+    """Condiciones obligatorias que se pueden buscar como texto (las medidas numéricas no)."""
+    terms = []
     for r in (p.get("requirements") or []):
         if r.get("kind") != "Obligatorio":
             continue
-        val, label = (r.get("value") or "").strip(), re.sub(r"\(.*?\)", "", r.get("label") or "").strip()
+        val = (r.get("value") or "").strip()
+        label = re.sub(r"\(.*?\)", "", r.get("label") or "").strip()
         if val.lower() in ("sí", "si", "yes", "x") and label:
-            extra.append(label)
+            terms.append(label)
         elif val and not re.search(r"\d", val) and len(val) <= 25:
-            extra.append(val)
-    q2 = " ".join([base] + extra[:3])
-    return [q1] if q2.lower() == q1.lower() else [q1, q2]
+            terms.append(val)
+    return terms
+
+
+def build_queries(p: dict) -> list:
+    """1) Producto exacto con condiciones obligatorias, marca y modelo. 2) Equivalentes de cualquier marca.
+    3) Nombre + primera frase de las características u observaciones."""
+    base = p["name"].strip()
+    brand, model = (p.get("brand") or "").strip(), (p.get("model") or "").strip()
+    hard = _hard_terms(p)[:3]
+    q1 = " ".join(x for x in [base, *hard, brand if brand.lower() not in base.lower() else "", model] if x)
+    q2 = " ".join([base] + hard)
+    free = re.split(r"[.\n;]", (p.get("features") or p.get("notes") or "").strip())[0].strip()[:70]
+    q3 = free if (free and base.lower() in free.lower()) else f"{base} {free}".strip()
+    out = []
+    for q in (q1, q2, q3):
+        if q and q.lower() not in [o.lower() for o in out]:
+            out.append(q)
+    return out
+
+
+SYNONYMS = {"dividida": ["split", "bipartida", "dos bases", "2 bases"], "dividido": ["split", "bipartido"],
+            "inox": ["acero inoxidable", "inoxidable", "stainless"],
+            "no frost": ["nofrost", "no-frost", "frost free"]}
+
+
+def _norm(t: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", (t or "").lower()) if unicodedata.category(c) != "Mn")
+
+
+def check_reqs(p: dict, alt: dict) -> list:
+    """Compara los requisitos obligatorios de texto con el título del resultado.
+    Estados: ok (aparece en el título), missing (no aparece; la ficha podría cumplirlo), unknown (no verificable)."""
+    title, out = _norm(alt["title"]), []
+    for r in (p.get("requirements") or []):
+        if r.get("kind") != "Obligatorio":
+            continue
+        label = re.sub(r"\(.*?\)", "", r.get("label") or "").strip()
+        val = (r.get("value") or "").strip()
+        if not label:
+            continue
+        if val.lower() in ("sí", "si", "yes", "x"):
+            kw, text = label, label
+        elif val and not re.search(r"\d", val) and len(val) <= 25:
+            kw, text = val, f"{label}: {val}"
+        else:
+            out.append((f"{label}{': ' + val if val else ''}", "unknown"))
+            continue
+        variants = [_norm(kw)] + [_norm(v) for v in SYNONYMS.get(_norm(kw), [])]
+        out.append((text, "ok" if any(v in title for v in variants) else "missing"))
+    return out
 
 
 def search_serper(p: dict, limit: int = 20):
@@ -791,7 +844,7 @@ def search_serper(p: dict, limit: int = 20):
                 store, link = (it.get("source") or "").strip(), it.get("link")
                 if not (store and link):
                     continue
-                if re.search(r"mercado\s?libre|mercadolibre|mercadolivre", f"{store} {link}", re.I):
+                if is_excluded(store, link):
                     continue
                 items.setdefault(link, {
                     "store": store, "title": it.get("title", ""), "brand": None,
@@ -801,7 +854,7 @@ def search_serper(p: dict, limit: int = 20):
                     "source": "Google Shopping Chile (Serper)"})
         except Exception as e:
             errors.append(str(e))
-    msg = f"{len(items)} resultados únicos con {len(queries)} búsqueda(s), sin Mercado Libre"
+    msg = f"{len(items)} resultados únicos con {len(queries)} búsqueda(s), sin tiendas excluidas"
     return list(items.values()), msg + (" · errores: " + "; ".join(errors) if errors else "")
 
 
@@ -823,6 +876,11 @@ def auto_quote(p: dict):
     try:
         items, statuses = run_search(p)
         st.session_state[f"qs_{p['id']}"] = statuses
+        if items:
+            old = db().table("alternatives").select("id,source,favorited_by").eq("product_id", p["id"]).execute().data
+            ids = [o["id"] for o in old if o["source"] != "Manual" and not o.get("favorited_by")]
+            if ids:
+                db().table("alternatives").delete().in_("id", ids).execute()
         save_alternatives(p, items)
         if items:
             log("Cotización nueva", f"{p['name']}: {len(items)} alternativas", p["id"])
@@ -883,9 +941,10 @@ def alt_card(p: dict, a: dict, tag: str = ""):
         if pb:
             hit = pb in (a.get("brand") or "").lower() or pb in a["title"].lower()
             meta.append("Marca preferida: " + ("sí" if hit else "no"))
-        n_req = sum(1 for r in (p.get("requirements") or []) if r.get("kind") == "Obligatorio")
-        if n_req:
-            meta.append(f"{n_req} requisito(s) obligatorio(s) sin verificar (dimensiones y fichas técnicas aún no se leen)")
+        checks = check_reqs(p, a)
+        if checks:
+            icon = {"ok": "✓", "missing": "✗ no aparece en el título", "unknown": "sin verificar"}
+            meta.append("Requisitos obligatorios: " + " · ".join(f"{t} {icon[st_]}" for t, st_ in checks))
         if a.get("free_shipping"):
             meta.append("Despacho gratis")
         meta.append(f"Fuente: {a['source']} · consultado {fmt_dt(a['retrieved_at'])}")
@@ -913,6 +972,9 @@ def page_quotes():
     p = by_id[pid]
     if p.get("budget_max"):
         st.caption(f"Presupuesto máximo: {clp(p['budget_max'])}")
+    if not [r for r in (p.get("requirements") or []) if r.get("kind") == "Obligatorio" and (r.get("label") or "").strip()]:
+        st.caption("Este producto no tiene requisitos obligatorios. Agrégalos en Editar (por ejemplo, Tamaño: King) "
+                   "para guiar la búsqueda y separar los resultados que no coinciden; las observaciones no filtran.")
 
     if not search_ready():
         st.info("Para buscar automáticamente en tiendas de Chile falta una API de búsqueda: crea una cuenta en "
@@ -935,6 +997,14 @@ def page_quotes():
         st.caption(f"Detalle: {e}")
         return
 
+    stale = [a for a in alts if a["source"] != "Manual" and is_excluded(a["store"], a["url"])]
+    for a in stale:
+        try:
+            db().table("alternatives").delete().eq("id", a["id"]).execute()
+        except Exception:
+            pass
+    alts = [a for a in alts if a not in stale]
+
     if alts:
         found_stores = sorted({a["store"] for a in alts})
         missing = [s for s in STORE_LIST if not any(s.lower() in f.lower() for f in found_stores)]
@@ -944,6 +1014,8 @@ def page_quotes():
                        "tiendas; que no aparezcan no significa que no lo vendan.")
     ok = sorted([a for a in alts if budget_status(p, a.get("price"))[1] is not False], key=lambda a: (a.get("price") is None, a.get("price") or 0))
     over = sorted([a for a in alts if budget_status(p, a.get("price"))[1] is False], key=lambda a: a["price"])
+    unconfirmed = [a for a in ok if any(s == "missing" for _, s in check_reqs(p, a))]
+    ok = [a for a in ok if a not in unconfirmed]
     priced = [a for a in ok if a.get("price")]
     cheapest = priced[0]["id"] if priced else None
     st.markdown(f"### Alternativas ({len(alts)})")
@@ -951,6 +1023,11 @@ def page_quotes():
         st.caption("Aún no hay alternativas. Busca en las tiendas o agrega una manualmente abajo.")
     for a in ok:
         alt_card(p, a, "💰 Mejor precio" if a["id"] == cheapest else "")
+    if unconfirmed:
+        with st.expander(f"No confirman lo pedido ({len(unconfirmed)})"):
+            st.caption("Su título no menciona alguna condición obligatoria. La ficha podría cumplirla, pero no está verificado.")
+            for a in unconfirmed:
+                alt_card(p, a)
     if over:
         with st.expander(f"Fuera de presupuesto ({len(over)})"):
             for a in over:
