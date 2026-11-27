@@ -11,16 +11,17 @@ PUESTA EN MARCHA
        SUPABASE_KEY = "eyJ... (service_role)"
        APP_PASSWORD = "una-clave-larga-que-solo-saben-ustedes"
 4. Cada uno entra con su nombre y la clave compartida.
-
-SEGURIDAD: la clave service_role vive solo en los secrets del servidor de Streamlit,
-nunca llega al navegador. Las tablas tienen RLS activo y sin políticas, por lo que la
-clave pública (anon) no puede leer nada. El acceso lo controla APP_PASSWORD: usa una
-clave larga y no compartas el link con sesión iniciada (contiene un token de sesión).
+5. Cotizar automático: crea una cuenta en serper.dev, copia tu API key y agrégala a los
+   secrets como SERPER_API_KEY. Sin esa clave la app funciona igual, con alternativas manuales.
+   Instalación existente: ejecuta el SQL de Ajustes > "SQL Fase 2" (no borra datos).
 """
 import hashlib
 import hmac
+import re
 from datetime import date, datetime
+from urllib.parse import urlparse
 
+import requests
 import streamlit as st
 from supabase import create_client
 
@@ -57,7 +58,7 @@ SCHEMA_SQL = """
 -- HOME DUO · Esquema Fase 1 (sin cuentas de correo)
 -- Ejecutar completo en Supabase > SQL Editor. Borra y recrea las tablas de HOME DUO.
 
-drop table if exists activity, comments, purchases, products, categories, household_members, households cascade;
+drop table if exists alternatives, activity, comments, purchases, products, categories, household_members, households cascade;
 drop function if exists is_member(uuid);
 drop function if exists create_household(text, text);
 drop function if exists join_household(text, text);
@@ -146,6 +147,27 @@ create table activity (
 );
 create index idx_activity_hh on activity(household_id, created_at desc);
 
+create table alternatives (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  product_id uuid not null references products(id) on delete cascade,
+  store text not null,
+  title text not null,
+  brand text,
+  price numeric(14,0),
+  old_price numeric(14,0),
+  url text not null,
+  image_url text,
+  free_shipping boolean,
+  source text not null default 'Manual',
+  retrieved_at timestamptz not null default now(),
+  added_by text,
+  favorited_by text[] not null default '{}',
+  created_at timestamptz not null default now(),
+  unique (product_id, url)
+);
+create index idx_alt_product on alternatives(product_id);
+
 -- RLS activo y SIN políticas: la clave pública (anon) no puede leer ni escribir nada.
 -- La app accede con la clave service_role, guardada solo en los secrets del servidor.
 alter table households enable row level security;
@@ -154,11 +176,38 @@ alter table products   enable row level security;
 alter table purchases  enable row level security;
 alter table comments   enable row level security;
 alter table activity   enable row level security;
+alter table alternatives enable row level security;
 
 -- Permisos para la clave service_role (algunos proyectos nuevos no los dan por defecto).
 grant usage on schema public to service_role;
 grant all on all tables in schema public to service_role;
 grant all on all sequences in schema public to service_role;
+"""
+
+MIGRATION_F2 = """
+-- HOME DUO · Fase 2 (instalación existente; NO borra datos)
+create table if not exists alternatives (
+  id uuid primary key default gen_random_uuid(),
+  household_id uuid not null references households(id) on delete cascade,
+  product_id uuid not null references products(id) on delete cascade,
+  store text not null,
+  title text not null,
+  brand text,
+  price numeric(14,0),
+  old_price numeric(14,0),
+  url text not null,
+  image_url text,
+  free_shipping boolean,
+  source text not null default 'Manual',
+  retrieved_at timestamptz not null default now(),
+  added_by text,
+  favorited_by text[] not null default '{}',
+  created_at timestamptz not null default now(),
+  unique (product_id, url)
+);
+create index if not exists idx_alt_product on alternatives(product_id);
+alter table alternatives enable row level security;
+grant all on all tables in schema public to service_role;
 """
 
 DEFAULT_CATEGORIES = ["Living", "Comedor", "Cocina", "Electrodomésticos", "Dormitorio principal",
@@ -368,6 +417,9 @@ def product_dialog(p: dict | None = None):
                 data["created_by"] = st.session_state["uid"]
                 res = db().table("products").insert(data).execute()
                 log("Producto agregado", name.strip(), res.data[0]["id"])
+                if search_ready():
+                    with st.spinner("Buscando alternativas en tiendas de Chile…"):
+                        auto_quote(res.data[0])
             st.rerun()
         except Exception as e:
             show_error(e)
@@ -627,12 +679,334 @@ def page_settings():
                 show_error(e)
     st.markdown("### Sesión")
     st.write(f"Entraste como **{st.session_state['uid']}**.")
-    with st.expander("Esquema SQL (referencia)"):
+    with st.expander("Diagnóstico de tiendas (avanzado)"):
+        diagnostics_ui()
+    with st.expander("SQL Fase 2 (instalación existente)"):
+        st.code(MIGRATION_F2, language="sql")
+    with st.expander("Esquema SQL completo (instalación nueva; BORRA datos)"):
         st.code(SCHEMA_SQL, language="sql")
     if st.button("Cerrar sesión", use_container_width=True):
         st.session_state.clear()
         st.query_params.clear()
         st.rerun()
+
+
+# ───────────────────────── Fase 2 · Cotizaciones ─────────────────────────
+HEADERS = {"User-Agent": "HOME-DUO/1.0 (herramienta personal de cotización)", "Accept-Language": "es-CL,es;q=0.9"}
+STORE_LIST = ["Falabella", "Paris", "Ripley", "Sodimac", "Easy", "Lider", "Hites", "ABC", "La Polar"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def robots_allows(url: str):
+    """True/False según el robots.txt del sitio; None si no se pudo leer."""
+    from urllib.robotparser import RobotFileParser
+    p = urlparse(url)
+    try:
+        r = requests.get(f"{p.scheme}://{p.netloc}/robots.txt", headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            return None
+        rp = RobotFileParser()
+        rp.parse(r.text.splitlines())
+        return rp.can_fetch(HEADERS["User-Agent"], url)
+    except Exception:
+        return None
+
+
+def diagnose_url(url: str) -> dict:
+    """Informa qué ve la app (desde Streamlit Cloud) al pedir una página. No guarda nada."""
+    out = {"robots.txt permite esta URL": robots_allows(url)}
+    if out["robots.txt permite esta URL"] is False:
+        out["conclusión"] = "El sitio no permite acceso automatizado a esta ruta: no se consulta."
+        return out
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+    t = r.text
+    m = re.search(r"<title[^>]*>(.*?)</title>", t, re.S | re.I)
+    out.update({
+        "HTTP": r.status_code,
+        "tamaño (bytes)": len(r.content),
+        "título": (m.group(1).strip()[:120] if m else None),
+        "tiene JSON-LD (datos estructurados)": "application/ld+json" in t,
+        "tiene __NEXT_DATA__": "__NEXT_DATA__" in t,
+        "aparecen precios en el HTML": bool(re.search(r"\$\s?\d", t)),
+        "señales de bloqueo": any(k in t.lower() for k in ("captcha", "access denied", "cloudflare", "akamai", "unusual traffic")),
+    })
+    return out
+
+
+def _int(x):
+    try:
+        return int(round(float(x))) if x else None
+    except (TypeError, ValueError):
+        return None
+
+
+def search_ready() -> bool:
+    return bool(st.secrets.get("SERPER_API_KEY"))
+
+
+def _price_clp(txt):
+    m = re.search(r"\d[\d\.,]*", str(txt or ""))
+    return _int(re.sub(r"\D", "", m.group(0))) if m else None
+
+
+def build_queries(p: dict) -> list:
+    """Consulta 1: producto exacto (nombre + marca + modelo). Consulta 2: equivalentes de cualquier
+    marca con las características textuales obligatorias (las medidas numéricas no se pueden buscar)."""
+    base = p["name"].strip()
+    brand, model = (p.get("brand") or "").strip(), (p.get("model") or "").strip()
+    q1 = " ".join(x for x in [base, brand if brand.lower() not in base.lower() else "", model] if x)
+    extra = []
+    for r in (p.get("requirements") or []):
+        if r.get("kind") != "Obligatorio":
+            continue
+        val, label = (r.get("value") or "").strip(), re.sub(r"\(.*?\)", "", r.get("label") or "").strip()
+        if val.lower() in ("sí", "si", "yes", "x") and label:
+            extra.append(label)
+        elif val and not re.search(r"\d", val) and len(val) <= 25:
+            extra.append(val)
+    q2 = " ".join([base] + extra[:3])
+    return [q1] if q2.lower() == q1.lower() else [q1, q2]
+
+
+def search_serper(p: dict, limit: int = 20):
+    """Google Shopping (Chile) vía Serper. Excluye Mercado Libre. Devuelve (items, estado)."""
+    key = st.secrets.get("SERPER_API_KEY")
+    if not key:
+        return [], "Sin configurar: falta SERPER_API_KEY en los secrets."
+    queries = build_queries(p)
+    items, errors = {}, []
+    for q in queries:
+        try:
+            r = requests.post("https://google.serper.dev/shopping", timeout=20,
+                              headers={"X-API-KEY": str(key), "Content-Type": "application/json"},
+                              json={"q": q, "gl": "cl", "hl": "es", "num": limit})
+            if r.status_code != 200:
+                errors.append(f"HTTP {r.status_code}: {r.text[:150]}")
+                continue
+            for it in r.json().get("shopping", []):
+                store, link = (it.get("source") or "").strip(), it.get("link")
+                if not (store and link):
+                    continue
+                if re.search(r"mercado\s?libre|mercadolibre|mercadolivre", f"{store} {link}", re.I):
+                    continue
+                items.setdefault(link, {
+                    "store": store, "title": it.get("title", ""), "brand": None,
+                    "price": _price_clp(it.get("price")), "old_price": None, "url": link,
+                    "image_url": it.get("imageUrl"),
+                    "free_shipping": True if "gratis" in str(it.get("delivery") or "").lower() else None,
+                    "source": "Google Shopping Chile (Serper)"})
+        except Exception as e:
+            errors.append(str(e))
+    msg = f"{len(items)} resultados únicos con {len(queries)} búsqueda(s), sin Mercado Libre"
+    return list(items.values()), msg + (" · errores: " + "; ".join(errors) if errors else "")
+
+
+# Cada fuente es independiente: si una falla, las demás siguen funcionando.
+ADAPTERS = {"Google Shopping Chile": search_serper}
+
+
+def run_search(p: dict):
+    found, statuses = [], {}
+    for name, fn in ADAPTERS.items():
+        items, msg = fn(p)
+        statuses[name] = msg
+        found += items
+    return found, statuses
+
+
+def auto_quote(p: dict):
+    """Busca y guarda alternativas para un producto, y lo pasa a 'En cotización'."""
+    try:
+        items, statuses = run_search(p)
+        st.session_state[f"qs_{p['id']}"] = statuses
+        save_alternatives(p, items)
+        if items:
+            log("Cotización nueva", f"{p['name']}: {len(items)} alternativas", p["id"])
+            if p["status"] == "Pendiente de cotización":
+                db().table("products").update({"status": "En cotización", "updated_by": st.session_state["uid"],
+                                               "updated_at": datetime.utcnow().isoformat() + "Z"}).eq("id", p["id"]).execute()
+    except Exception as e:
+        st.session_state[f"qs_{p['id']}"] = {"Error": str(e)}
+
+
+def save_alternatives(p: dict, items: list):
+    now = datetime.utcnow().isoformat() + "Z"
+    rows = {}
+    for it in items:
+        rows[it["url"]] = {"household_id": st.session_state["hid"], "product_id": p["id"], "store": it["store"],
+                           "title": it["title"], "brand": it.get("brand"), "price": it.get("price"),
+                           "old_price": it.get("old_price"), "url": it["url"], "image_url": it.get("image_url"),
+                           "free_shipping": it.get("free_shipping"), "source": it["source"],
+                           "retrieved_at": now, "added_by": st.session_state["uid"]}
+    if rows:
+        db().table("alternatives").upsert(list(rows.values()), on_conflict="product_id,url").execute()
+
+
+def budget_status(p: dict, price):
+    mx = p.get("budget_max")
+    if not price:
+        return "Precio no verificado", None
+    if not mx:
+        return "Sin presupuesto definido", None
+    if price <= float(mx):
+        return "Dentro del presupuesto", True
+    return f"Excede el máximo por {clp(price - float(mx))}", False
+
+
+def toggle_fav(a: dict, p: dict):
+    me = st.session_state["uid"]
+    fav = list(a.get("favorited_by") or [])
+    fav.remove(me) if me in fav else fav.append(me)
+    db().table("alternatives").update({"favorited_by": fav}).eq("id", a["id"]).execute()
+    if me in fav:
+        log("Alternativa favorita", f"{p['name']}: {a['title'][:60]}", p["id"])
+    st.rerun()
+
+
+def alt_card(p: dict, a: dict, tag: str = ""):
+    status, _ = budget_status(p, a.get("price"))
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 3])
+        if a.get("image_url"):
+            c1.image(a["image_url"], width=90)
+        c2.markdown((f"{tag}  \n" if tag else "") + f"**{a['title']}**")
+        line = f"{a['store']} · **{clp(a.get('price'))}**"
+        if a.get("old_price") and a.get("price") and float(a["old_price"]) > float(a["price"]):
+            line += f" · antes {clp(a['old_price'])} (-{round((1 - float(a['price']) / float(a['old_price'])) * 100)}%)"
+        c2.markdown(line)
+        meta = [status]
+        pb = (p.get("brand") or "").lower()
+        if pb:
+            hit = pb in (a.get("brand") or "").lower() or pb in a["title"].lower()
+            meta.append("Marca preferida: " + ("sí" if hit else "no"))
+        n_req = sum(1 for r in (p.get("requirements") or []) if r.get("kind") == "Obligatorio")
+        if n_req:
+            meta.append(f"{n_req} requisito(s) obligatorio(s) sin verificar (dimensiones y fichas técnicas aún no se leen)")
+        if a.get("free_shipping"):
+            meta.append("Despacho gratis")
+        meta.append(f"Fuente: {a['source']} · consultado {fmt_dt(a['retrieved_at'])}")
+        st.markdown("<span class='muted'>" + "<br>".join(meta) + "</span>", unsafe_allow_html=True)
+        if a.get("favorited_by"):
+            st.markdown("❤️ Favorito de " + ", ".join(a["favorited_by"]))
+        b1, b2, b3 = st.columns(3)
+        b1.link_button("Ver tienda", a["url"], use_container_width=True)
+        me = st.session_state["uid"]
+        if b2.button("Quitar ♥" if me in (a.get("favorited_by") or []) else "♡ Favorito", key=f"fv_{a['id']}", use_container_width=True):
+            toggle_fav(a, p)
+        if b3.button("Eliminar", key=f"rm_{a['id']}", use_container_width=True):
+            db().table("alternatives").delete().eq("id", a["id"]).execute()
+            st.rerun()
+
+
+def page_quotes():
+    st.markdown("## Cotizar")
+    products = [p for p in fetch("products") if p["status"] not in ("Comprado", "Descartado")]
+    if not products:
+        st.info("Primero agrega un producto en Productos.")
+        return
+    by_id = {p["id"]: p for p in products}
+    pid = st.selectbox("Producto", list(by_id), format_func=lambda i: by_id[i]["name"])
+    p = by_id[pid]
+    if p.get("budget_max"):
+        st.caption(f"Presupuesto máximo: {clp(p['budget_max'])}")
+
+    if not search_ready():
+        st.info("Para buscar automáticamente en tiendas de Chile falta una API de búsqueda: crea una cuenta en "
+                "serper.dev y agrega la clave como SERPER_API_KEY en los secrets de Streamlit. Mientras tanto "
+                "puedes agregar alternativas manualmente más abajo.")
+    elif st.button("Buscar y cotizar alternativas", type="primary", use_container_width=True):
+        with st.spinner("Buscando en tiendas de Chile…"):
+            auto_quote(p)
+    statuses = st.session_state.get(f"qs_{pid}")
+    if statuses:
+        st.markdown("**Qué se consultó**")
+        for store, msg in statuses.items():
+            st.caption(f"• {store}: {msg}")
+
+    try:
+        alts = db().table("alternatives").select("*").eq("product_id", pid).execute().data
+    except Exception as e:
+        st.warning("Falta la tabla de alternativas. Ejecuta este SQL en Supabase (no borra datos):")
+        st.code(MIGRATION_F2, language="sql")
+        st.caption(f"Detalle: {e}")
+        return
+
+    if alts:
+        found_stores = sorted({a["store"] for a in alts})
+        missing = [s for s in STORE_LIST if not any(s.lower() in f.lower() for f in found_stores)]
+        st.caption("Tiendas con resultados: " + ", ".join(found_stores))
+        if missing:
+            st.caption("Sin resultados de: " + ", ".join(missing) + ". La búsqueda no garantiza cubrir todas las "
+                       "tiendas; que no aparezcan no significa que no lo vendan.")
+    ok = sorted([a for a in alts if budget_status(p, a.get("price"))[1] is not False], key=lambda a: (a.get("price") is None, a.get("price") or 0))
+    over = sorted([a for a in alts if budget_status(p, a.get("price"))[1] is False], key=lambda a: a["price"])
+    priced = [a for a in ok if a.get("price")]
+    cheapest = priced[0]["id"] if priced else None
+    st.markdown(f"### Alternativas ({len(alts)})")
+    if not alts:
+        st.caption("Aún no hay alternativas. Busca en las tiendas o agrega una manualmente abajo.")
+    for a in ok:
+        alt_card(p, a, "💰 Mejor precio" if a["id"] == cheapest else "")
+    if over:
+        with st.expander(f"Fuera de presupuesto ({len(over)})"):
+            for a in over:
+                alt_card(p, a)
+
+    with st.expander("Agregar alternativa manualmente"):
+        with st.form(f"man_{pid}", clear_on_submit=True):
+            store = st.text_input("Tienda *")
+            title = st.text_input("Nombre del producto *")
+            url = st.text_input("Link *")
+            c1, c2 = st.columns(2)
+            price = c1.number_input("Precio actual (CLP)", min_value=0, step=1000)
+            old = c2.number_input("Precio anterior (CLP)", min_value=0, step=1000)
+            if st.form_submit_button("Guardar alternativa", type="primary"):
+                if not (store.strip() and title.strip() and url.strip().startswith("http")):
+                    st.warning("Completa tienda, nombre y un link que empiece con http.")
+                else:
+                    try:
+                        save_alternatives(p, [{"store": store.strip(), "title": title.strip(), "url": url.strip(),
+                                               "price": int(price) or None, "old_price": int(old) or None,
+                                               "source": "Manual"}])
+                        log("Cotización nueva", f"{p['name']}: {store.strip()} (manual)", pid)
+                        st.rerun()
+                    except Exception as e:
+                        show_error(e)
+
+
+def page_favorites():
+    st.markdown("## Favoritos")
+    try:
+        alts = [a for a in fetch("alternatives") if a.get("favorited_by")]
+    except Exception as e:
+        show_error(e)
+        return
+    prods = {p["id"]: p for p in fetch("products")}
+    if not alts:
+        st.info("Todavía no hay favoritos. Márcalos con ♡ desde Cotizar.")
+        return
+    people = sorted({n for a in alts for n in a["favorited_by"]})
+    for person in people:
+        st.markdown(f"### ❤️ {person}")
+        for a in alts:
+            if person in a["favorited_by"]:
+                p = prods.get(a["product_id"], {"name": "Producto"})
+                with st.container(border=True):
+                    st.markdown(f"**{p['name']}** — {a['title']}  \n{a['store']} · **{clp(a.get('price'))}**")
+                    st.link_button("Ver tienda", a["url"])
+
+
+def diagnostics_ui():
+    st.caption("Pega la URL de una búsqueda o de un producto de una tienda. Muestra qué ve la app y si el sitio "
+               "permite el acceso automatizado (robots.txt). No guarda nada.")
+    url = st.text_input("URL a probar", placeholder="https://www.tienda.cl/...")
+    if st.button("Probar") and url.startswith("http"):
+        with st.spinner("Consultando…"):
+            st.json(diagnose_url(url.strip()))
 
 
 def setup_guide(reason: str):
@@ -676,7 +1050,8 @@ def main():
             setup_guide(f"No se pudo leer la base de datos. Detalle: {e}")
             st.stop()
 
-    pages = {"Inicio": page_home, "Productos": page_products, "Comprados": page_bought,
+    pages = {"Inicio": page_home, "Productos": page_products, "Cotizar": page_quotes,
+             "Favoritos": page_favorites, "Comprados": page_bought,
              "Categorías": page_categories, "Ajustes": page_settings}
     choice = st.segmented_control("Navegación", list(pages), default="Inicio", label_visibility="collapsed")
     c1, _ = st.columns([1, 3])
